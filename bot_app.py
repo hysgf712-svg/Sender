@@ -609,12 +609,14 @@ async def handle_membership_failure(
     user_id: int,
     missing: Sequence[Dict[str, str]],
 ) -> None:
-    # Repeat this warning on /start and every member-content action while still unsubscribed.
-    mark_membership_inactive(user_id)
-    try:
-        await client.send_message(user_id, subscription_cancelled_notice(missing))
-    except Exception as exc:
-        logger.info("Could not send membership-cancelled notice to %s: %s", user_id, exc)
+    # A first-time visitor who never passed the join check has no cancelled subscription.
+    # Only send the cancellation warning when an already-active user is newly found absent.
+    was_active = mark_membership_inactive(user_id)
+    if was_active:
+        try:
+            await client.send_message(user_id, subscription_cancelled_notice(missing))
+        except Exception as exc:
+            logger.info("Could not send membership-cancelled notice to %s: %s", user_id, exc)
     await show_force_join(client, user_id, missing)
 
 
@@ -958,10 +960,11 @@ async def start_command(client: Client, message: Message) -> None:
         return
     uid = user.id
     if is_admin(uid):
-        add_user(user)
         admin_states.pop(uid, None)
         joined, missing = await check_membership(client, uid)
-        if not joined:
+        if joined:
+            add_user(user)
+        else:
             await handle_membership_failure(client, uid, missing)
         await send_admin_panel(client, uid)
         return
@@ -977,10 +980,11 @@ async def start_command(client: Client, message: Message) -> None:
 async def panel_command(client: Client, message: Message) -> None:
     user = message.from_user
     if user and is_admin(user.id):
-        add_user(user)
         admin_states.pop(user.id, None)
         joined, missing = await check_membership(client, user.id)
-        if not joined:
+        if joined:
+            add_user(user)
+        else:
             await handle_membership_failure(client, user.id, missing)
         await send_admin_panel(client, user.id)
     elif user:
@@ -1305,36 +1309,58 @@ async def callback_handler(client: Client, cb: CallbackQuery) -> None:
 @app.on_chat_member_updated()
 async def force_channel_member_update(client: Client, update: Any) -> None:
     """Proactively notify registered users when they leave a required channel/group."""
-    if not is_force_channel_chat(getattr(update, "chat", None)):
-        return
+    chat = getattr(update, "chat", None)
     new_member = getattr(update, "new_chat_member", None)
-    user = getattr(new_member, "user", None)
-    if not user:
-        return
-    logger.info(
-        "Membership update: chat_id=%s username=%s user_id=%s status=%s force_chat=%s",
-        getattr(getattr(update, "chat", None), "id", None),
-        getattr(getattr(update, "chat", None), "username", None),
-        user.id,
-        getattr(new_member, "status", None),
-        is_force_channel_chat(getattr(update, "chat", None)),
+    old_member = getattr(update, "old_chat_member", None)
+    new_user = getattr(new_member, "user", None)
+    old_user = getattr(old_member, "user", None)
+    # Pyrogram can report a leave as new_chat_member=None; in that case the
+    # departed user's identity/status are carried by old_chat_member.
+    user = new_user or old_user
+    new_status = getattr(new_member, "status", None)
+    old_status = getattr(old_member, "status", None)
+    left_event = (
+        new_status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED)
+        or (new_member is None and old_member is not None)
     )
+    required_chat = is_force_channel_chat(chat)
+    logger.info(
+        "Chat-member update: chat_id=%s title=%s username=%s user_id=%s old_status=%s new_status=%s left_event=%s required_chat=%s",
+        getattr(chat, "id", None),
+        getattr(chat, "title", None),
+        getattr(chat, "username", None),
+        getattr(user, "id", None),
+        old_status,
+        new_status,
+        left_event,
+        required_chat,
+    )
+    if not required_chat or not user:
+        return
     # Administrator accounts are intentionally handled like other registered users.
-    status = getattr(new_member, "status", None)
-    if status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
-        # Don't suppress this alert based on the cached flag: each leave event should
-        # name the particular channel/group that was just left.
+    if left_event:
+        # A user with no prior successful bot membership check never had an active
+        # subscription, so don't describe a first-time join failure as a cancellation.
+        known_user = conn.execute("SELECT 1 FROM users WHERE user_id=?", (user.id,)).fetchone()
+        if known_user is None:
+            logger.info("No cancellation notice for user %s: no prior bot membership record", user.id)
+            return
         mark_membership_inactive(user.id)
-        chat = getattr(update, "chat", None)
         departed_chat = str(getattr(chat, "title", None) or "").strip()
         if not departed_chat:
             username = getattr(chat, "username", None)
             chat_id = getattr(chat, "id", None)
             departed_chat = f"@{username}" if username else str(chat_id or "کانال/گروه")
         try:
-            await client.send_message(
+            sent_notice = await client.send_message(
                 user.id,
                 subscription_cancelled_notice([], departed_chat=departed_chat),
+            )
+            logger.info(
+                "Immediate cancellation notice accepted by Telegram: user_id=%s chat_id=%s message_id=%s",
+                user.id,
+                getattr(chat, "id", None),
+                getattr(sent_notice, "id", None),
             )
         except Exception as exc:
             logger.info("Could not send membership-cancelled notice to %s: %s", user.id, exc)
