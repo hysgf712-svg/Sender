@@ -577,16 +577,44 @@ async def show_force_join(client: Client, chat_id: int, missing: Sequence[Dict[s
     )
 
 
+def subscription_cancelled_notice(
+    missing: Sequence[Dict[str, str]],
+    departed_chat: Optional[str] = None,
+) -> str:
+    """Build the cancellation notice, naming the chat(s) the user currently lacks."""
+    names: List[str] = []
+    if departed_chat:
+        names.append(departed_chat)
+    for item in missing:
+        name = str(item.get("title") or item.get("id") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    if not names:
+        return SUBSCRIPTION_CANCELLED_TEXT
+
+    if departed_chat:
+        detail = f"از این کانال/گروه خارج شدید:\n• {departed_chat}"
+        other_names = [name for name in names if name != departed_chat]
+        if other_names:
+            detail += "\n\nعضویت شما در این کانال/گروه‌های دیگر هم تأیید نیست:\n"
+            detail += "\n".join(f"• {name}" for name in other_names)
+    else:
+        detail = "عضویت شما در کانال/گروه‌های زیر تأیید نیست:\n"
+        detail += "\n".join(f"• {name}" for name in names)
+    return f"{SUBSCRIPTION_CANCELLED_TEXT}\n\n{detail}"
+
+
 async def handle_membership_failure(
     client: Client,
     user_id: int,
     missing: Sequence[Dict[str, str]],
 ) -> None:
-    if mark_membership_inactive(user_id):
-        try:
-            await client.send_message(user_id, SUBSCRIPTION_CANCELLED_TEXT)
-        except Exception as exc:
-            logger.info("Could not send membership-cancelled notice to %s: %s", user_id, exc)
+    # Repeat this warning on /start and every member-content action while still unsubscribed.
+    mark_membership_inactive(user_id)
+    try:
+        await client.send_message(user_id, subscription_cancelled_notice(missing))
+    except Exception as exc:
+        logger.info("Could not send membership-cancelled notice to %s: %s", user_id, exc)
     await show_force_join(client, user_id, missing)
 
 
@@ -932,6 +960,9 @@ async def start_command(client: Client, message: Message) -> None:
     if is_admin(uid):
         add_user(user)
         admin_states.pop(uid, None)
+        joined, missing = await check_membership(client, uid)
+        if not joined:
+            await handle_membership_failure(client, uid, missing)
         await send_admin_panel(client, uid)
         return
     joined, missing = await check_membership(client, uid)
@@ -948,6 +979,9 @@ async def panel_command(client: Client, message: Message) -> None:
     if user and is_admin(user.id):
         add_user(user)
         admin_states.pop(user.id, None)
+        joined, missing = await check_membership(client, user.id)
+        if not joined:
+            await handle_membership_failure(client, user.id, missing)
         await send_admin_panel(client, user.id)
     elif user:
         await message.reply_text("این دستور فقط برای مدیر ربات است.")
@@ -1288,11 +1322,20 @@ async def force_channel_member_update(client: Client, update: Any) -> None:
     # Administrator accounts are intentionally handled like other registered users.
     status = getattr(new_member, "status", None)
     if status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
-        was_active = mark_membership_inactive(user.id)
-        if not was_active:
-            return
+        # Don't suppress this alert based on the cached flag: each leave event should
+        # name the particular channel/group that was just left.
+        mark_membership_inactive(user.id)
+        chat = getattr(update, "chat", None)
+        departed_chat = str(getattr(chat, "title", None) or "").strip()
+        if not departed_chat:
+            username = getattr(chat, "username", None)
+            chat_id = getattr(chat, "id", None)
+            departed_chat = f"@{username}" if username else str(chat_id or "کانال/گروه")
         try:
-            await client.send_message(user.id, SUBSCRIPTION_CANCELLED_TEXT)
+            await client.send_message(
+                user.id,
+                subscription_cancelled_notice([], departed_chat=departed_chat),
+            )
         except Exception as exc:
             logger.info("Could not send membership-cancelled notice to %s: %s", user.id, exc)
         try:
