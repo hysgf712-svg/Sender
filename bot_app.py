@@ -946,6 +946,7 @@ async def start_command(client: Client, message: Message) -> None:
 async def panel_command(client: Client, message: Message) -> None:
     user = message.from_user
     if user and is_admin(user.id):
+        add_user(user)
         admin_states.pop(user.id, None)
         await send_admin_panel(client, user.id)
     elif user:
@@ -1006,11 +1007,11 @@ async def callback_handler(client: Client, cb: CallbackQuery) -> None:
     # Custom member buttons.
     if data.startswith("b:"):
         await cb.answer()
-        if not is_admin(uid):
-            joined, missing = await check_membership(client, uid)
-            if not joined:
-                await handle_membership_failure(client, uid, missing)
-                return
+        joined, missing = await check_membership(client, uid)
+        if not joined:
+            await handle_membership_failure(client, uid, missing)
+            return
+        add_user(cb.from_user)
         try:
             button_id = int(data.split(":", 1)[1])
         except ValueError:
@@ -1050,6 +1051,11 @@ async def callback_handler(client: Client, cb: CallbackQuery) -> None:
             "برای ذخیره /done یا دکمهٔ «اتمام» را بزنید؛ برای لغو /cancel.",
         )
     elif data == "start_preview":
+        joined, missing = await check_membership(client, uid)
+        if not joined:
+            await handle_membership_failure(client, uid, missing)
+            return
+        add_user(cb.from_user)
         await send_sequence(client, uid, get_start_content(), reply_markup=user_home_keyboard())
     elif data == "start_reset":
         set_setting("start_content", DEFAULT_START_CONTENT)
@@ -1269,9 +1275,17 @@ async def force_channel_member_update(client: Client, update: Any) -> None:
         return
     new_member = getattr(update, "new_chat_member", None)
     user = getattr(new_member, "user", None)
-    if not user or is_admin(user.id):
+    if not user:
         return
-
+    logger.info(
+        "Membership update: chat_id=%s username=%s user_id=%s status=%s force_chat=%s",
+        getattr(getattr(update, "chat", None), "id", None),
+        getattr(getattr(update, "chat", None), "username", None),
+        user.id,
+        getattr(new_member, "status", None),
+        is_force_channel_chat(getattr(update, "chat", None)),
+    )
+    # Administrator accounts are intentionally handled like other registered users.
     status = getattr(new_member, "status", None)
     if status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
         was_active = mark_membership_inactive(user.id)
@@ -1363,13 +1377,12 @@ async def handle_member_menu_message(client: Client, message: Message) -> None:
     button = find_member_button(text)
     is_check = text.casefold() == check_label
 
-    # Members must pass the forced-join check before receiving any custom response.
-    if not is_admin(uid):
-        joined, missing = await check_membership(client, uid)
-        if not joined:
-            await handle_membership_failure(client, uid, missing)
-            return
-        add_user(user)
+    # Check every custom-menu action, including when an administrator is testing the member menu.
+    joined, missing = await check_membership(client, uid)
+    if not joined:
+        await handle_membership_failure(client, uid, missing)
+        return
+    add_user(user)
 
     if is_check:
         await message.reply_text("عضویت تأیید شد ✅", reply_markup=user_home_keyboard())
