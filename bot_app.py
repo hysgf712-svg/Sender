@@ -9,7 +9,7 @@ import logging
 import os
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
@@ -120,6 +120,18 @@ conn.executescript(
         content_json TEXT NOT NULL DEFAULT '[]',
         position     INTEGER NOT NULL DEFAULT 0
     );
+
+    CREATE TABLE IF NOT EXISTS scheduled_broadcasts (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_by   INTEGER NOT NULL,
+        items_json   TEXT NOT NULL,
+        run_at_utc   TEXT NOT NULL,
+        status       TEXT NOT NULL DEFAULT 'pending',
+        created_at_utc TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_error   TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_scheduled_broadcasts_due
+        ON scheduled_broadcasts(status, run_at_utc);
     """
 )
 _user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
@@ -127,6 +139,12 @@ if "membership_ok" not in _user_columns:
     # Existing registrations were added only after passing the required-channel check.
     conn.execute("ALTER TABLE users ADD COLUMN membership_ok INTEGER NOT NULL DEFAULT 1")
 conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (OWNER_ID,))
+interrupted_schedules = conn.execute(
+    "UPDATE scheduled_broadcasts SET status='failed', last_error=? WHERE status='running'",
+    ("Interrupted by bot restart before completion",),
+).rowcount
+if interrupted_schedules:
+    logger.warning("Marked %s interrupted scheduled broadcast(s) as failed", interrupted_schedules)
 conn.commit()
 
 DEFAULT_START_CONTENT: List[Dict[str, Any]] = [
@@ -150,6 +168,9 @@ conn.commit()
 admin_states: Dict[int, Dict[str, Any]] = {}
 MAX_USER_BUTTONS = 30
 MAX_SEQUENCE_ITEMS = 50
+IRAN_TZ = timezone(timedelta(hours=3, minutes=30), name="Asia/Tehran")
+BROADCAST_CONCURRENCY = 6
+BROADCAST_SEND_INTERVAL_SECONDS = 0.05  # 20 outbound message requests/second, below Telegram's usual bot limit.
 
 
 def get_setting(key: str) -> str:
@@ -908,7 +929,18 @@ def button_type_keyboard() -> InlineKeyboardMarkup:
 
 def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🚀 ارسال برای همه", callback_data="broadcast_confirm"), InlineKeyboardButton("❌ لغو", callback_data="broadcast_cancel")]]
+        [
+            [InlineKeyboardButton("🚀 ارسال برای همه", callback_data="broadcast_confirm")],
+            [InlineKeyboardButton("🕒 زمان‌بندی ارسال", callback_data="broadcast_schedule")],
+            [InlineKeyboardButton("❌ لغو", callback_data="broadcast_cancel")],
+        ]
+    )
+
+
+def scheduled_broadcasts_keyboard(rows: Sequence[sqlite3.Row]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"❌ لغو زمان‌بندی #{int(row['id'])}", callback_data=f"schedule_cancel:{int(row['id'])}")]
+         for row in rows[:50]]
     )
 
 
@@ -1015,6 +1047,38 @@ async def manual_backup_command(client: Client, message: Message) -> None:
         await status.edit_text("✅ بکاپ فوری با موفقیت به پیوی شما ارسال شد.")
     except Exception as status_exc:
         logger.warning("Could not confirm manual backup to owner: %s", status_exc)
+
+
+@app.on_message(filters.command("schedules") & filters.private)
+async def scheduled_broadcasts_command(client: Client, message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    if not is_admin(user.id):
+        await message.reply_text("❌ این دستور فقط برای مدیران ربات است.")
+        return
+    if user.id == OWNER_ID:
+        rows = conn.execute(
+            "SELECT id, run_at_utc, created_by FROM scheduled_broadcasts "
+            "WHERE status='pending' ORDER BY run_at_utc, id LIMIT 50"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, run_at_utc, created_by FROM scheduled_broadcasts "
+            "WHERE status='pending' AND created_by=? ORDER BY run_at_utc, id LIMIT 50",
+            (user.id,),
+        ).fetchall()
+    if not rows:
+        await message.reply_text("🕒 ارسال زمان‌بندی‌شدهٔ در انتظاری وجود ندارد.")
+        return
+    listing = "\n".join(
+        f"#{int(row['id'])} — {format_tehran_broadcast_time(str(row['run_at_utc']))} به وقت ایران"
+        for row in rows
+    )
+    await message.reply_text(
+        f"🕒 زمان‌بندی‌های در انتظار:\n{listing}\n\nبرای لغو، دکمهٔ مربوط به هر مورد را بزنید.",
+        reply_markup=scheduled_broadcasts_keyboard(rows),
+    )
 
 
 @app.on_message(filters.command(["panel", "admin"]) & filters.private)
@@ -1240,8 +1304,8 @@ async def callback_handler(client: Client, cb: CallbackQuery) -> None:
             cb,
             "collect_broadcast",
             "📢 پیام‌های ارسال همگانی را یکی‌یکی بفرستید؛ متن، عکس، ویدیو، فایل و پیام‌های دیگر قابل ارسال‌اند.\n"
-            "همهٔ پیام‌ها به‌ترتیب و در یک نوبت برای هر عضو می‌روند.\n"
-            "برای دیدن پیش‌نمایش و تأیید، /done یا «اتمام» را بزنید.",
+            "ترتیب پیام‌ها برای هر عضو حفظ می‌شود.\n"
+            "برای دیدن پیش‌نمایش، /done یا «اتمام» را بزنید؛ سپس می‌توانید فوری بفرستید یا زمان‌بندی کنید.",
         )
     elif data == "broadcast_confirm":
         state = admin_states.get(uid, {})
@@ -1252,10 +1316,50 @@ async def callback_handler(client: Client, cb: CallbackQuery) -> None:
         admin_states.pop(uid, None)
         await cb.message.edit_text("⏳ ارسال همگانی شروع شد؛ لطفاً پیام وضعیت را نگه دارید.")
         asyncio.create_task(run_broadcast(client, uid, items, cb.message))
+    elif data == "broadcast_schedule":
+        state = admin_states.get(uid, {})
+        if state.get("state") != "broadcast_confirm":
+            await cb.message.reply_text("ارسال آماده‌ای برای زمان‌بندی پیدا نشد؛ از پنل دوباره شروع کنید.")
+            return
+        state["state"] = "awaiting_broadcast_schedule"
+        admin_states[uid] = state
+        await update_state_prompt(
+            client,
+            uid,
+            state,
+            "🕒 ساعت ۲۴ساعتهٔ ارسال را به وقت ایران بفرستید؛ مثل 4 (=04:00)، 16 (=16:00) یا 04:30.\n"
+            "ارسال یک‌بار در نوبت بعدی آن ساعت انجام می‌شود (اگر گذشته باشد، فردا).\n"
+            "برای لغو /cancel را بفرستید.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو زمان‌بندی", callback_data="wizard_cancel")]]),
+        )
     elif data == "broadcast_cancel":
         state = admin_states.pop(uid, None)
         if state:
             await update_state_prompt(client, uid, state, "❌ ارسال همگانی لغو شد.", admin_panel_keyboard())
+    elif data.startswith("schedule_cancel:"):
+        try:
+            schedule_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        row = conn.execute(
+            "SELECT created_by, status FROM scheduled_broadcasts WHERE id=?",
+            (schedule_id,),
+        ).fetchone()
+        if not row or row["status"] != "pending":
+            await cb.message.edit_text("این زمان‌بندی دیگر در انتظار اجرا نیست.")
+            return
+        if uid != OWNER_ID and int(row["created_by"]) != uid:
+            await cb.message.edit_text("❌ فقط مالک یا سازندهٔ این زمان‌بندی می‌تواند آن را لغو کند.")
+            return
+        cursor = conn.execute(
+            "UPDATE scheduled_broadcasts SET status='cancelled' WHERE id=? AND status='pending'",
+            (schedule_id,),
+        )
+        conn.commit()
+        if cursor.rowcount:
+            await cb.message.edit_text(f"✅ زمان‌بندی #{schedule_id} لغو شد.")
+        else:
+            await cb.message.edit_text("این زمان‌بندی دیگر در انتظار اجرا نیست.")
     elif data == "force_menu":
         channels = force_channels()
         listing = "\n".join(f"{i}. {channel}" for i, channel in enumerate(channels, 1)) or "هیچ کانالی تنظیم نشده است."
@@ -1458,7 +1562,7 @@ async def finish_collection(client: Client, user_id: int) -> None:
             user_id,
             state,
             f"📢 پیش‌نمایش آماده است.\n\nتعداد پیام‌ها: {len(items)}\nگیرندگان فعلی: {user_count}\n"
-            "با تأیید، همهٔ پیام‌ها به‌ترتیب برای هر عضو ارسال می‌شوند.",
+            "ارسال فوری را انتخاب کنید یا برای ساعت دلخواه ایران زمان‌بندی کنید.", 
             broadcast_confirm_keyboard(),
         )
 
@@ -1517,7 +1621,7 @@ async def handle_member_menu_message(client: Client, message: Message) -> None:
 
 @app.on_message(
     filters.private
-    & ~filters.command(["start", "panel", "admin", "done", "cancel", "backup", "backup_now"])
+    & ~filters.command(["start", "panel", "admin", "done", "cancel", "backup", "backup_now", "schedules"])
 )
 async def admin_workflow_message(client: Client, message: Message) -> None:
     user = message.from_user
@@ -1546,7 +1650,32 @@ async def admin_workflow_message(client: Client, message: Message) -> None:
     text = message.text or ""
     stripped = text.strip()
 
-    if state_name in ("collect_start", "collect_button_content", "collect_button_update", "collect_broadcast"):
+    if state_name == "awaiting_broadcast_schedule":
+        try:
+            local_run_at = next_tehran_broadcast_time(stripped)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+            return
+        items = list(state.get("items", []))
+        if not items:
+            admin_states.pop(uid, None)
+            await message.reply_text("❌ محتوایی برای زمان‌بندی وجود ندارد؛ دوباره از ارسال همگانی شروع کنید.")
+            return
+        try:
+            schedule_id = create_scheduled_broadcast(uid, items, local_run_at)
+        except Exception as exc:
+            logger.exception("Could not save scheduled broadcast for admin %s", uid)
+            await message.reply_text(f"❌ ذخیرهٔ زمان‌بندی انجام نشد: {exc}")
+            return
+        admin_states.pop(uid, None)
+        await message.reply_text(
+            f"✅ ارسال همگانی #{schedule_id} برای {local_run_at.strftime('%Y-%m-%d %H:%M')} به وقت ایران ثبت شد.\n"
+            "ارسال یک‌بار در نوبت بعدی همین ساعت انجام می‌شود.\n"
+            "برای دیدن یا لغو زمان‌بندی‌ها دستور /schedules را بفرستید."
+        )
+        return
+
+    if state_name in ("collect_start", "collect_button_content", "collect_button_update", "collect_broadcast"): 
         if len(state.get("items", [])) >= MAX_SEQUENCE_ITEMS:
             await message.reply_text(f"حداکثر {MAX_SEQUENCE_ITEMS} پیام در هر مجموعه پذیرفته می‌شود؛ برای ذخیره /done را بفرستید.")
             return
@@ -1734,6 +1863,90 @@ def progress_bar(percent: int) -> str:
     return "█" * filled + "░" * (10 - filled)
 
 
+class BroadcastRateLimiter:
+    """Space Telegram send requests globally while allowing concurrent recipients."""
+
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self._lock = asyncio.Lock()
+        self._next_allowed = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_allowed - now)
+            if delay:
+                await asyncio.sleep(delay)
+            self._next_allowed = time.monotonic() + self.interval
+
+    async def defer(self, seconds: float) -> None:
+        async with self._lock:
+            self._next_allowed = max(self._next_allowed, time.monotonic() + seconds)
+
+
+_broadcast_rate_limiter: Optional[BroadcastRateLimiter] = None
+
+
+def get_broadcast_rate_limiter() -> BroadcastRateLimiter:
+    global _broadcast_rate_limiter
+    if _broadcast_rate_limiter is None:
+        _broadcast_rate_limiter = BroadcastRateLimiter(BROADCAST_SEND_INTERVAL_SECONDS)
+    return _broadcast_rate_limiter
+
+
+async def send_broadcast_item(client: Client, user_id: int, item: Dict[str, Any]) -> Message:
+    limiter = get_broadcast_rate_limiter()
+    await limiter.acquire()
+    try:
+        return await send_content_item(client, user_id, item)
+    except FloodWait as exc:
+        wait_seconds = max(1, int(getattr(exc, "value", 1)))
+        logger.warning("Broadcast FloodWait; pausing sends for %s seconds", wait_seconds)
+        await limiter.defer(wait_seconds + 1)
+        await limiter.acquire()
+        try:
+            return await send_content_item(client, user_id, item)
+        except FloodWait as retry_exc:
+            retry_wait = max(1, int(getattr(retry_exc, "value", 1)))
+            await limiter.defer(retry_wait + 1)
+            raise
+
+
+def next_tehran_broadcast_time(value: str) -> datetime:
+    """Resolve HH[:MM] to its next one-time occurrence in Iran's local time."""
+    digit_map = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+    normalized = (value or "").strip().translate(digit_map)
+    parts = normalized.split(":")
+    if len(parts) not in (1, 2) or not all(part.isdigit() for part in parts):
+        raise ValueError("ساعت را به شکل ۴ یا ۰۴:۳۰ وارد کنید؛ زمان به وقت ایران است.")
+    hour = int(parts[0])
+    minute = int(parts[1]) if len(parts) == 2 else 0
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError("ساعت معتبر نیست؛ ساعت ۰ تا ۲۳ و دقیقه ۰ تا ۵۹ باشد.")
+    now = datetime.now(IRAN_TZ)
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target
+
+
+def create_scheduled_broadcast(admin_id: int, items: Sequence[Dict[str, Any]], run_at: datetime) -> int:
+    cursor = conn.execute(
+        "INSERT INTO scheduled_broadcasts (created_by, items_json, run_at_utc) VALUES (?, ?, ?)",
+        (
+            int(admin_id),
+            json.dumps(list(items), ensure_ascii=False),
+            run_at.astimezone(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid)
+
+
+def format_tehran_broadcast_time(run_at_utc: str) -> str:
+    return datetime.fromisoformat(run_at_utc).astimezone(IRAN_TZ).strftime("%Y-%m-%d %H:%M")
+
+
 async def _run_broadcast_impl(
     client: Client,
     admin_id: int,
@@ -1746,111 +1959,125 @@ async def _run_broadcast_impl(
         await status_message.edit_text("❌ هنوز عضوی برای ارسال همگانی ثبت نشده است.", reply_markup=admin_panel_keyboard())
         return
 
-    success = 0
-    failed = 0
-    removed = 0
-    skipped_membership = 0
-    processed = 0
+    counters = {"success": 0, "failed": 0, "removed": 0, "skipped_membership": 0, "processed": 0}
     last_percent = -5
     started_at = time.monotonic()
+    progress_lock = asyncio.Lock()
+    user_queue: asyncio.Queue[int] = asyncio.Queue()
+    for user_id in user_ids:
+        user_queue.put_nowait(user_id)
+
     await status_message.edit_text(
         f"⏳ ارسال {len(items)} پیام برای {total} عضو شروع شد.\n"
-        "هر بسته به‌ترتیب برای هر عضو فرستاده می‌شود."
+        "ارسال چند گیرنده هم‌زمان است؛ ترتیب پیام‌ها برای هر گیرنده حفظ می‌شود."
     )
 
-    for user_id in user_ids:
+    async def process_recipient(user_id: int) -> None:
+        nonlocal last_percent
         user_ok = True
+        skipped = False
+        removed_for_user = 0
         try:
-            joined, missing = await check_membership(client, user_id)
-        except Exception as exc:
-            logger.warning("Broadcast membership check failed for %s: %s", user_id, exc)
-            joined, missing = False, []
-        if not joined:
-            removed_unreachable = await handle_membership_failure(client, user_id, missing)
-            if removed_unreachable:
-                removed += 1
-            user_ok = False
-            skipped_membership += 1
-
-        if user_ok:
-            for item in items:
-                try:
-                    await send_content_item(client, user_id, item)
-                except FloodWait as exc:
-                    wait_seconds = max(1, int(getattr(exc, "value", 1)))
-                    logger.warning("FloodWait while broadcasting; sleeping %s seconds", wait_seconds)
-                    await asyncio.sleep(wait_seconds + 1)
-                    try:
-                        await send_content_item(client, user_id, item)
-                    except Exception as retry_exc:
-                        user_ok = False
-                        if is_permanently_unreachable(retry_exc):
-                            conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-                            removed += 1
-                        logger.info("Broadcast retry failed for %s: %s", user_id, retry_exc)
-                        break
-                except Exception as exc:
-                    user_ok = False
-                    if is_permanently_unreachable(exc):
-                        conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-                        removed += 1
-                    logger.info("Broadcast failed for %s: %s", user_id, exc)
-                    break
-                # Conservative global send rate; Telegram limits apply across the bot, not per recipient.
-                await asyncio.sleep(0.045)
-
-        if user_ok:
-            success += 1
-        else:
-            failed += 1
-        processed += 1
-
-        percent = int(processed * 100 / total)
-        if percent >= last_percent + 5 or processed == total:
-            last_percent = (percent // 5) * 5
-            elapsed = int(time.monotonic() - started_at)
-            rate = processed / max(1, elapsed)
-            eta = int((total - processed) / rate) if rate > 0 else 0
-            status = (
-                f"📢 در حال ارسال همگانی\n\n[{progress_bar(percent)}] {percent}%\n\n"
-                f"👥 کل: {total}\n🔄 بررسی‌شده: {processed}\n"
-                f"✅ موفق: {success}\n❌ ناموفق: {failed}\n"
-                f"🔒 رد به‌خاطر جوین اجباری: {skipped_membership}\n"
-                f"🗑 حذف‌شده (مسدود/غیرفعال): {removed}\n"
-                f"⏱ زمان سپری‌شده: {elapsed} ثانیه | زمان تقریبی باقی‌مانده: {eta} ثانیه"
-            )
             try:
-                await status_message.edit_text(status)
-            except MessageNotModified:
-                pass
-            except FloodWait as exc:
-                await asyncio.sleep(max(1, int(getattr(exc, "value", 1))))
+                joined, missing = await check_membership(client, user_id)
             except Exception as exc:
-                logger.debug("Could not update broadcast progress: %s", exc)
+                logger.warning("Broadcast membership check failed for %s: %s", user_id, exc)
+                joined, missing = False, []
 
+            if not joined:
+                skipped = True
+                user_ok = False
+                try:
+                    if await handle_membership_failure(client, user_id, missing):
+                        removed_for_user = 1
+                except Exception:
+                    logger.exception("Membership-failure handling crashed for %s", user_id)
+            else:
+                for item in items:
+                    try:
+                        await send_broadcast_item(client, user_id, item)
+                    except Exception as exc:
+                        user_ok = False
+                        if is_permanently_unreachable(exc):
+                            try:
+                                cursor = conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+                                removed_for_user = int(cursor.rowcount > 0)
+                            except Exception:
+                                logger.exception("Could not remove unreachable user %s", user_id)
+                        logger.info("Broadcast failed for %s: %s", user_id, exc)
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            user_ok = False
+            logger.exception("Unexpected per-recipient broadcast error for %s", user_id)
+
+        async with progress_lock:
+            counters["success"] += int(user_ok)
+            counters["failed"] += int(not user_ok)
+            counters["removed"] += removed_for_user
+            counters["skipped_membership"] += int(skipped)
+            counters["processed"] += 1
+
+            processed = counters["processed"]
+            percent = int(processed * 100 / total)
+            if percent >= last_percent + 5 or processed == total:
+                last_percent = (percent // 5) * 5
+                elapsed = int(time.monotonic() - started_at)
+                rate = processed / max(1, elapsed)
+                eta = int((total - processed) / rate) if rate > 0 else 0
+                status = (
+                    f"📢 در حال ارسال همگانی\n\n[{progress_bar(percent)}] {percent}%\n\n"
+                    f"👥 کل: {total}\n🔄 بررسی‌شده: {processed}\n"
+                    f"✅ موفق: {counters['success']}\n❌ ناموفق: {counters['failed']}\n"
+                    f"🔒 رد به‌خاطر جوین اجباری: {counters['skipped_membership']}\n"
+                    f"🗑 حذف‌شده (مسدود/غیرفعال): {counters['removed']}\n"
+                    f"⏱ زمان سپری‌شده: {elapsed} ثانیه | زمان تقریبی باقی‌مانده: {eta} ثانیه"
+                )
+                try:
+                    await status_message.edit_text(status)
+                except MessageNotModified:
+                    pass
+                except FloodWait as exc:
+                    await asyncio.sleep(max(1, int(getattr(exc, "value", 1))))
+                except Exception as exc:
+                    logger.debug("Could not update broadcast progress: %s", exc)
+
+    async def worker() -> None:
+        while True:
+            try:
+                user_id = user_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await process_recipient(user_id)
+            finally:
+                user_queue.task_done()
+
+    await asyncio.gather(*(worker() for _ in range(min(BROADCAST_CONCURRENCY, total))))
     conn.commit()
     elapsed = int(time.monotonic() - started_at)
     await status_message.edit_text(
         f"✅ ارسال همگانی تمام شد.\n\n"
         f"📨 تعداد پیام در هر بسته: {len(items)}\n"
         f"👥 گیرندگان اولیه: {total}\n"
-        f"✅ ارسال کامل: {success}\n❌ ناموفق/ناقص: {failed}\n"
-        f"🔒 رد به‌خاطر جوین اجباری: {skipped_membership}\n"
-        f"🗑 حذف‌شده از فهرست اعضا: {removed}\n"
+        f"✅ ارسال کامل: {counters['success']}\n❌ ناموفق/ناقص: {counters['failed']}\n"
+        f"🔒 رد به‌خاطر جوین اجباری: {counters['skipped_membership']}\n"
+        f"🗑 حذف‌شده از فهرست اعضا: {counters['removed']}\n"
         f"⏱ مدت: {elapsed} ثانیه",
         reply_markup=admin_panel_keyboard(),
     )
-
 
 async def run_broadcast(
     client: Client,
     admin_id: int,
     items: Sequence[Dict[str, Any]],
     status_message: Message,
-) -> None:
+) -> bool:
     """Keep one recipient or status-message failure from killing the whole task."""
     try:
         await _run_broadcast_impl(client, admin_id, items, status_message)
+        return True
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -1863,6 +2090,75 @@ async def run_broadcast(
             )
         except Exception as status_exc:
             logger.warning("Could not report broadcast failure to admin %s: %s", admin_id, status_exc)
+        return False
+
+async def scheduled_broadcast_worker(client: Client) -> None:
+    """Run persistent one-time broadcasts once their Tehran-scheduled time is due."""
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            row = conn.execute(
+                "SELECT id, created_by, items_json, run_at_utc FROM scheduled_broadcasts "
+                "WHERE status='pending' AND run_at_utc<=? ORDER BY run_at_utc, id LIMIT 1",
+                (now_utc,),
+            ).fetchone()
+            if row is None:
+                await asyncio.sleep(5)
+                continue
+
+            schedule_id = int(row["id"])
+            claimed = conn.execute(
+                "UPDATE scheduled_broadcasts SET status='running' WHERE id=? AND status='pending'",
+                (schedule_id,),
+            ).rowcount
+            conn.commit()
+            if not claimed:
+                continue
+
+            admin_id = int(row["created_by"])
+            try:
+                items = json.loads(row["items_json"])
+                if not isinstance(items, list) or not items:
+                    raise ValueError("Scheduled broadcast has no valid message items")
+                local_time = format_tehran_broadcast_time(str(row["run_at_utc"]))
+                status_message = await client.send_message(
+                    admin_id,
+                    f"⏰ زمان ارسال زمان‌بندی‌شدهٔ شمارهٔ {schedule_id} رسید ({local_time} به وقت ایران).",
+                )
+                completed = await run_broadcast(client, admin_id, items, status_message)
+                status = "completed" if completed else "failed"
+                error_text = "" if completed else "Broadcast ended with an unexpected error"
+                conn.execute(
+                    "UPDATE scheduled_broadcasts SET status=?, last_error=? WHERE id=?",
+                    (status, error_text, schedule_id),
+                )
+                conn.commit()
+            except asyncio.CancelledError:
+                conn.execute(
+                    "UPDATE scheduled_broadcasts SET status='failed', last_error=? WHERE id=?",
+                    ("Interrupted while the bot was stopping", schedule_id),
+                )
+                conn.commit()
+                raise
+            except Exception as exc:
+                logger.exception("Scheduled broadcast %s failed", schedule_id)
+                conn.execute(
+                    "UPDATE scheduled_broadcasts SET status='failed', last_error=? WHERE id=?",
+                    (str(exc)[:500], schedule_id),
+                )
+                conn.commit()
+                try:
+                    await client.send_message(
+                        admin_id,
+                        f"❌ ارسال زمان‌بندی‌شدهٔ شمارهٔ {schedule_id} شروع نشد؛ جزئیات در لاگ ربات ثبت شد.",
+                    )
+                except Exception as notify_exc:
+                    logger.warning("Could not notify admin %s about schedule %s: %s", admin_id, schedule_id, notify_exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Scheduled-broadcast worker loop failed")
+            await asyncio.sleep(10)
 
 
 BACKUP_INTERVAL_SECONDS = 24 * 60 * 60
@@ -1915,6 +2211,7 @@ async def register_owner_commands(client: Client) -> None:
                 BotCommand("start", "شروع ربات"),
                 BotCommand("panel", "پنل مدیریت"),
                 BotCommand("backup", "ارسال فوری بکاپ JSON"),
+                BotCommand("schedules", "دیدن/لغو زمان‌بندی ارسال"),
                 BotCommand("done", "اتمام دریافت پیام‌ها"),
                 BotCommand("cancel", "لغو عملیات"),
             ],
@@ -1930,16 +2227,22 @@ async def main() -> None:
     logger.info("Connecting Telegram bot...")
     await app.start()
     backup_task = None
+    scheduled_broadcast_task = None
     try:
         await register_owner_commands(app)
         me = await app.get_me()
         logger.info("Bot ready: @%s | local database: %s", me.username or "unknown", DB_PATH)
         backup_task = asyncio.create_task(periodic_owner_backup(app), name="daily-owner-db-backup")
+        scheduled_broadcast_task = asyncio.create_task(
+            scheduled_broadcast_worker(app), name="scheduled-broadcast-worker"
+        )
         await idle()
     finally:
-        if backup_task:
-            backup_task.cancel()
-            await asyncio.gather(backup_task, return_exceptions=True)
+        tasks_to_cancel = [task for task in (backup_task, scheduled_broadcast_task) if task]
+        for task in tasks_to_cancel:
+            task.cancel()
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         try:
             await app.stop()
         except Exception:
