@@ -608,7 +608,8 @@ async def handle_membership_failure(
     client: Client,
     user_id: int,
     missing: Sequence[Dict[str, str]],
-) -> None:
+) -> bool:
+    """Notify about missing membership; return True if an unreachable user was removed."""
     # A first-time visitor who never passed the join check has no cancelled subscription.
     # Only send the cancellation warning when an already-active user is newly found absent.
     was_active = mark_membership_inactive(user_id)
@@ -617,7 +618,21 @@ async def handle_membership_failure(
             await client.send_message(user_id, subscription_cancelled_notice(missing))
         except Exception as exc:
             logger.info("Could not send membership-cancelled notice to %s: %s", user_id, exc)
-    await show_force_join(client, user_id, missing)
+    try:
+        await show_force_join(client, user_id, missing)
+    except Exception as exc:
+        logger.info("Could not send force-join prompt to %s: %s", user_id, exc)
+        if is_permanently_unreachable(exc):
+            try:
+                cursor = conn.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+                conn.commit()
+                removed = cursor.rowcount > 0
+                if removed:
+                    logger.info("Removed unreachable user %s after force-join delivery failure", user_id)
+                return removed
+            except Exception:
+                logger.exception("Could not remove unreachable user %s", user_id)
+    return False
 
 
 def is_force_channel_chat(chat: Any) -> bool:
@@ -974,6 +989,32 @@ async def start_command(client: Client, message: Message) -> None:
         return
     add_user(user)
     await send_welcome(client, uid)
+
+
+@app.on_message(filters.command(["backup", "backup_now"]) & filters.private)
+async def manual_backup_command(client: Client, message: Message) -> None:
+    user = message.from_user
+    if not user:
+        return
+    if user.id != OWNER_ID:
+        await message.reply_text("❌ این دستور فقط برای مالک ربات است.")
+        return
+
+    status = await message.reply_text("⏳ در حال ساخت و ارسال بکاپ JSON فوری...")
+    try:
+        await send_owner_backup(client)
+    except Exception:
+        logger.exception("Manual JSON backup failed for owner %s", OWNER_ID)
+        try:
+            await status.edit_text("❌ ساخت یا ارسال بکاپ ناموفق بود؛ جزئیات در لاگ ثبت شد.")
+        except Exception as status_exc:
+            logger.warning("Could not report manual backup failure to owner: %s", status_exc)
+        return
+
+    try:
+        await status.edit_text("✅ بکاپ فوری با موفقیت به پیوی شما ارسال شد.")
+    except Exception as status_exc:
+        logger.warning("Could not confirm manual backup to owner: %s", status_exc)
 
 
 @app.on_message(filters.command(["panel", "admin"]) & filters.private)
@@ -1476,7 +1517,7 @@ async def handle_member_menu_message(client: Client, message: Message) -> None:
 
 @app.on_message(
     filters.private
-    & ~filters.command(["start", "panel", "admin", "done", "cancel"])
+    & ~filters.command(["start", "panel", "admin", "done", "cancel", "backup", "backup_now"])
 )
 async def admin_workflow_message(client: Client, message: Message) -> None:
     user = message.from_user
@@ -1693,7 +1734,7 @@ def progress_bar(percent: int) -> str:
     return "█" * filled + "░" * (10 - filled)
 
 
-async def run_broadcast(
+async def _run_broadcast_impl(
     client: Client,
     admin_id: int,
     items: Sequence[Dict[str, Any]],
@@ -1725,7 +1766,9 @@ async def run_broadcast(
             logger.warning("Broadcast membership check failed for %s: %s", user_id, exc)
             joined, missing = False, []
         if not joined:
-            await handle_membership_failure(client, user_id, missing)
+            removed_unreachable = await handle_membership_failure(client, user_id, missing)
+            if removed_unreachable:
+                removed += 1
             user_ok = False
             skipped_membership += 1
 
@@ -1799,11 +1842,34 @@ async def run_broadcast(
     )
 
 
+async def run_broadcast(
+    client: Client,
+    admin_id: int,
+    items: Sequence[Dict[str, Any]],
+    status_message: Message,
+) -> None:
+    """Keep one recipient or status-message failure from killing the whole task."""
+    try:
+        await _run_broadcast_impl(client, admin_id, items, status_message)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("Unhandled broadcast failure for admin %s", admin_id)
+        try:
+            await status_message.edit_text(
+                "❌ ارسال همگانی به‌علت خطای غیرمنتظره متوقف شد.\n"
+                "جزئیات در لاگ ربات ثبت شده است.",
+                reply_markup=admin_panel_keyboard(),
+            )
+        except Exception as status_exc:
+            logger.warning("Could not report broadcast failure to admin %s: %s", admin_id, status_exc)
+
+
 BACKUP_INTERVAL_SECONDS = 24 * 60 * 60
 
 
 async def send_owner_backup(client: Client) -> None:
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-UTC")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f-UTC")
     backup_path = DATA_DIR / f"custom-bot-backup-{timestamp}.json"
     try:
         await asyncio.to_thread(write_json_backup, backup_path)
@@ -1812,7 +1878,7 @@ async def send_owner_backup(client: Client) -> None:
             document=str(backup_path),
             caption=f"🗄 بکاپ JSON ربات | {timestamp}\nبرای بازیابی، همین فایل را در پیوی ربات ارسال کنید."
         )
-        logger.info("Daily JSON backup sent to owner %s", OWNER_ID)
+        logger.info("JSON backup sent to owner %s", OWNER_ID)
     finally:
         try:
             backup_path.unlink(missing_ok=True)
@@ -1839,11 +1905,33 @@ async def periodic_owner_backup(client: Client) -> None:
             await asyncio.sleep(60 * 60)
 
 
+async def register_owner_commands(client: Client) -> None:
+    """Show the owner's private command menu, including the manual backup command."""
+    try:
+        from pyrogram.types import BotCommand, BotCommandScopeChat
+
+        await client.set_bot_commands(
+            [
+                BotCommand("start", "شروع ربات"),
+                BotCommand("panel", "پنل مدیریت"),
+                BotCommand("backup", "ارسال فوری بکاپ JSON"),
+                BotCommand("done", "اتمام دریافت پیام‌ها"),
+                BotCommand("cancel", "لغو عملیات"),
+            ],
+            scope=BotCommandScopeChat(chat_id=OWNER_ID),
+        )
+        logger.info("Registered private command menu for bot owner")
+    except Exception as exc:
+        # The /backup handler remains available even if Telegram rejects menu registration.
+        logger.warning("Could not register owner command menu: %s", exc)
+
+
 async def main() -> None:
     logger.info("Connecting Telegram bot...")
     await app.start()
     backup_task = None
     try:
+        await register_owner_commands(app)
         me = await app.get_me()
         logger.info("Bot ready: @%s | local database: %s", me.username or "unknown", DB_PATH)
         backup_task = asyncio.create_task(periodic_owner_backup(app), name="daily-owner-db-backup")
