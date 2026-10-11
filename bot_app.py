@@ -1318,19 +1318,44 @@ async def callback_handler(client: Client, cb: CallbackQuery) -> None:
         asyncio.create_task(run_broadcast(client, uid, items, cb.message))
     elif data == "broadcast_schedule":
         state = admin_states.get(uid, {})
-        if state.get("state") != "broadcast_confirm":
+        if state.get("state") not in ("broadcast_confirm", "awaiting_broadcast_day", "awaiting_broadcast_schedule") or not state.get("items"):
             await cb.message.reply_text("ارسال آماده‌ای برای زمان‌بندی پیدا نشد؛ از پنل دوباره شروع کنید.")
             return
-        state["state"] = "awaiting_broadcast_schedule"
+        state["state"] = "awaiting_broadcast_day"
+        state.pop("schedule_day_offset", None)
         admin_states[uid] = state
         await update_state_prompt(
             client,
             uid,
             state,
-            "🕒 ساعت ۲۴ساعتهٔ ارسال را به وقت ایران بفرستید؛ مثل 4 (=04:00)، 16 (=16:00) یا 04:30.\n"
-            "ارسال یک‌بار در نوبت بعدی آن ساعت انجام می‌شود (اگر گذشته باشد، فردا).\n"
+            "🕒 ابتدا روز ارسال را انتخاب کنید (به وقت ایران):\n"
+            f"می‌توانید تا {SCHEDULE_MAX_DAYS_AHEAD} روز آینده زمان‌بندی کنید.\n"
             "برای لغو /cancel را بفرستید.",
-            InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو زمان‌بندی", callback_data="wizard_cancel")]]),
+            broadcast_day_keyboard(),
+        )
+    elif data.startswith("schedule_day:"):
+        state = admin_states.get(uid, {})
+        if state.get("state") not in ("awaiting_broadcast_day", "awaiting_broadcast_schedule") or not state.get("items"):
+            await cb.message.reply_text("ارسال آماده‌ای برای زمان‌بندی پیدا نشد؛ از پنل دوباره شروع کنید.")
+            return
+        try:
+            day_offset = int(data.split(":", 1)[1])
+            if not 0 <= day_offset <= SCHEDULE_MAX_DAYS_AHEAD:
+                raise ValueError
+        except ValueError:
+            await cb.answer("روز انتخاب‌شده معتبر نیست.")
+            return
+        state["state"] = "awaiting_broadcast_schedule"
+        state["schedule_day_offset"] = day_offset
+        admin_states[uid] = state
+        await update_state_prompt(
+            client,
+            uid,
+            state,
+            f"🕒 روز ارسال: {schedule_day_text(day_offset)} (به وقت ایران)\n\n"
+            "حالا ساعت ۲۴ساعته را بفرستید؛ مثل 4 (=04:00)، 16 (=16:00) یا 04:30.\n"
+            "برای لغو /cancel را بفرستید.",
+            broadcast_time_keyboard(),
         )
     elif data == "broadcast_cancel":
         state = admin_states.pop(uid, None)
@@ -1650,9 +1675,14 @@ async def admin_workflow_message(client: Client, message: Message) -> None:
     text = message.text or ""
     stripped = text.strip()
 
+    if state_name == "awaiting_broadcast_day":
+        await message.reply_text("لطفاً روز ارسال را از دکمه‌های زیر پیام انتخاب کنید؛ برای لغو /cancel را بفرستید.")
+        return
+
     if state_name == "awaiting_broadcast_schedule":
+        day_offset = state.get("schedule_day_offset")
         try:
-            local_run_at = next_tehran_broadcast_time(stripped)
+            local_run_at = next_tehran_broadcast_time(stripped, day_offset=day_offset)
         except ValueError as exc:
             await message.reply_text(str(exc))
             return
@@ -1669,8 +1699,9 @@ async def admin_workflow_message(client: Client, message: Message) -> None:
             return
         admin_states.pop(uid, None)
         await message.reply_text(
-            f"✅ ارسال همگانی #{schedule_id} برای {local_run_at.strftime('%Y-%m-%d %H:%M')} به وقت ایران ثبت شد.\n"
-            "ارسال یک‌بار در نوبت بعدی همین ساعت انجام می‌شود.\n"
+            f"✅ ارسال همگانی #{schedule_id} برای {schedule_day_text(day_offset) if day_offset is not None else local_run_at.strftime('%Y-%m-%d')} "
+            f"ساعت {local_run_at.strftime('%H:%M')} به وقت ایران ثبت شد.\n"
+            "ارسال یک‌بار در همان زمان انجام می‌شود.\n"
             "برای دیدن یا لغو زمان‌بندی‌ها دستور /schedules را بفرستید."
         )
         return
@@ -1912,8 +1943,11 @@ async def send_broadcast_item(client: Client, user_id: int, item: Dict[str, Any]
             raise
 
 
-def next_tehran_broadcast_time(value: str) -> datetime:
-    """Resolve HH[:MM] to its next one-time occurrence in Iran's local time."""
+SCHEDULE_MAX_DAYS_AHEAD = 30
+PERSIAN_WEEKDAYS = ("دوشنبه", "سه‌شنبه", "چهارشنبه", "پنجشنبه", "جمعه", "شنبه", "یکشنبه")  # index = date.weekday()
+
+
+def parse_broadcast_hhmm(value: str) -> Tuple[int, int]:
     digit_map = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
     normalized = (value or "").strip().translate(digit_map)
     parts = normalized.split(":")
@@ -1923,11 +1957,71 @@ def next_tehran_broadcast_time(value: str) -> datetime:
     minute = int(parts[1]) if len(parts) == 2 else 0
     if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         raise ValueError("ساعت معتبر نیست؛ ساعت ۰ تا ۲۳ و دقیقه ۰ تا ۵۹ باشد.")
+    return hour, minute
+
+
+def next_tehran_broadcast_time(value: str, day_offset: Optional[int] = None) -> datetime:
+    """Resolve HH[:MM] to a one-time occurrence in Iran's local time.
+
+    day_offset=None: the next occurrence of that hour (today, or tomorrow if it has passed).
+    day_offset=N (0..30): exactly N days from today in Iran's local time (0 = today, must still be in the future).
+    """
+    hour, minute = parse_broadcast_hhmm(value)
     now = datetime.now(IRAN_TZ)
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if day_offset is None:
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return target
+    if not isinstance(day_offset, int) or not 0 <= day_offset <= SCHEDULE_MAX_DAYS_AHEAD:
+        raise ValueError(f"روز ارسال باید بین امروز تا {SCHEDULE_MAX_DAYS_AHEAD} روز آینده باشد.")
+    target_date = now.date() + timedelta(days=day_offset)
+    target = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=IRAN_TZ)
     if target <= now:
-        target += timedelta(days=1)
+        raise ValueError("این ساعت امروز گذشته است؛ ساعت بعدی یا یکی از روزهای آینده را انتخاب کنید.")
     return target
+
+
+def schedule_day_label(day_offset: int) -> str:
+    """Button label such as «فردا · جمعه 10-16» for a Tehran day offset from today."""
+    day = (datetime.now(IRAN_TZ) + timedelta(days=day_offset)).date()
+    prefix = {0: "امروز", 1: "فردا", 2: "پس‌فردا"}.get(day_offset)
+    weekday = PERSIAN_WEEKDAYS[day.weekday()]
+    label = f"{weekday} {day.month:02d}-{day.day:02d}"
+    return f"{prefix} · {label}" if prefix else label
+
+
+def schedule_day_text(day_offset: int) -> str:
+    day = (datetime.now(IRAN_TZ) + timedelta(days=day_offset)).date()
+    return f"{PERSIAN_WEEKDAYS[day.weekday()]} {day.isoformat()}"
+
+
+def broadcast_day_keyboard() -> InlineKeyboardMarkup:
+    """Days 0..30 from today in Iran time: 0 = today, 1 = tomorrow, 2 = day after tomorrow, ..."""
+    rows: List[List[InlineKeyboardButton]] = []
+    offsets = list(range(0, SCHEDULE_MAX_DAYS_AHEAD + 1))
+    # Today / tomorrow / day after get a full-width row each (most common choices); the rest 2 per row.
+    for n in offsets[:3]:
+        rows.append([InlineKeyboardButton(schedule_day_label(n), callback_data=f"schedule_day:{n}")])
+    rest = offsets[3:]
+    for start in range(0, len(rest), 2):
+        rows.append(
+            [
+                InlineKeyboardButton(schedule_day_label(n), callback_data=f"schedule_day:{n}")
+                for n in rest[start : start + 2]
+            ]
+        )
+    rows.append([InlineKeyboardButton("❌ لغو زمان‌بندی", callback_data="wizard_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def broadcast_time_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📅 تغییر روز", callback_data="broadcast_schedule")],
+            [InlineKeyboardButton("❌ لغو زمان‌بندی", callback_data="wizard_cancel")],
+        ]
+    )
 
 
 def create_scheduled_broadcast(admin_id: int, items: Sequence[Dict[str, Any]], run_at: datetime) -> int:
